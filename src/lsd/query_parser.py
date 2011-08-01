@@ -64,7 +64,8 @@ def parse(query):
 
 	    ra, dec, u , g, r, sdss.u, sdss.r, tmass.*, func(ra,dec) as xx WHERE (expr)
 	"""
-	g = tokenize.generate_tokens(StringIO.StringIO(query).readline)
+        sanitized_query = query.strip().replace('\n','')
+	g = tokenize.generate_tokens(StringIO.StringIO(sanitized_query).readline)
 	where_clause = 'True'
 	select_clause = []
 	from_clause = []
