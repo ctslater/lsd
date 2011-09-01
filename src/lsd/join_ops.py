@@ -763,16 +763,39 @@ class QueryInstance(object):
 			cols = eval(name, globals_, self)
 #			exit()
 
-			if len(asnames) == 1:
-				if type(cols) is tuple:
-					# Handle multi-valued returns when there are no ASNAMEs to capture them
-					# Note: for this to work, the UDF must return a tuple
-					asname = asnames[0]
-					asnames = [ '%s[%d]' % (asname, k) for k in xrange(len(cols)) ]
-				else:
-					cols = [ cols ]
-			assert len(asnames) == len(cols)
+			# eval() is expected to return:
+			#	- a plain numpy array, or
+			#	- a structured numpy array (or an object with the same API), or
+			#	- a tuple of (unnamed) columns
+			#       - a NamedList instance
+			# For the latter three cases, the number of generated columns may be > 1
+			# Also, if a structured array is return, we'll take it's field names
+			#     for the generated column names, if asnames is empty
+			# If a tuple is returned, and asnames is empty, we'll generate the
+			#     column names from 'name' by appending [0], [1], ...
 
+			if isinstance(cols, utils.NamedList):
+				asnames = cols.names
+				cols = tuple(cols)
+
+			if getattr(cols, 'dtype', None) is not None and cols.dtype.names is not None:
+				# A structured array
+				if not asnames:
+					asnames = cols.dtype.names
+
+				# Unpack to tuple
+				cols = tuple( cols[name] for name in cols.dtype.names )
+			elif type(cols) is tuple:
+				# A tuple
+				if not asnames:
+					asnames = [ '%s[%d]' % (name, k) for k in xrange(len(cols)) ]
+			else:
+				# A simple numpy array
+				if not asnames:
+					asnames = [ name ]
+				cols = [ cols ]
+
+			assert len(asnames) == len(cols)
 			for asname, col in zip(asnames, cols):
 				self[asname] = col
 				rows.add_column(asname, col)
@@ -1615,7 +1638,7 @@ class DB(object):
 
 		if udf_modules is None:
 			try:
-				udf_modules = os.environ['LSD_UDFS'].split(':')
+				udf_modules = os.environ['LSD_USER_MODULES'].split(':')
 			except KeyError:
 				udf_modules = []
 		self.udfs = self._load_udfs(self.path, udf_modules)
@@ -1632,7 +1655,7 @@ class DB(object):
 		# Return the global environment for query calls
 
 		# Import LSD's built-in functions
-		from . import user as u
+		from . import builtins as u
 		try:
 			globals_ = u.__all__.copy()
 		except AttributeError:
@@ -1654,14 +1677,19 @@ class DB(object):
 		setattr(self.udfs, name, udf)
 
 	def _load_udfs(self, pathlist, udf_modules):
-		import imp
+		import imp, hashlib
 
-		def _import_module(target, fp, pathname, description, k):
-			# Load
-			tmpnam = '_udf_tmp_%d' % k
-			if tmpnam in sys.modules:
-				del sys.modules[tmpnam]
-			m = imp.load_module(tmpnam, fp, pathname, description)
+		def _import_module(target, fp, pathname, description, modname):
+			# If the module name is unknown, construct a unique one using 
+			# the hash of the pathname
+			if modname is None:
+				modname = '_udfmodule_' + hashlib.md5(pathname).hexdigest()
+
+			# Get or load the module
+			try:
+				m = sys.modules[modname]
+			except KeyError:
+				m = imp.load_module(modname, fp, pathname, description)
 
 			# Extract all non-privates
 			names = getattr(m, '__all__', None)
@@ -1676,20 +1704,20 @@ class DB(object):
 			# Otherwise, import everything into top-level namespace
 			try:
 				lname = m.__lsd_name__
-				#udf_dest = imp.new_module(lname)
-				udf_dest = Namespace(lname)
+				udf_dest = utils.Namespace(lname)
 				setattr(target, lname, udf_dest)
 			except AttributeError:
 				udf_dest = target
 
 			# Do the import
 			for name in names:
-				setattr(udf_dest, name, getattr(m, name))
+				item = getattr(m, name)
+				if type(item) is type(imp):
+					item = utils.ModuleProxy(item)
+				setattr(udf_dest, name, item)
 
 		# Create a new module namespace
-		#udfs = imp.new_module('udfs')
-		udfs = Namespace('udfs')
-		k = 0
+		udfs = utils.Namespace('udfs')
 
 		# Load UDFs from the paths in reverse, so newer overwrite older
 		for path in reversed(pathlist):
@@ -1701,8 +1729,7 @@ class DB(object):
 				except ImportError:
 					continue
 
-				_import_module(udfs, fp, pathname, description, k)
-				k += 1
+				_import_module(udfs, fp, pathname, description, None)
 
 			finally:
 				if fp is not None:
@@ -1713,8 +1740,7 @@ class DB(object):
 			fp = None
 			try:
 				(fp, pathname, description) = imp.find_module(modname)
-				_import_module(udfs, fp, pathname, description, k)
-				k += 1
+				_import_module(udfs, fp, pathname, description, modname)
 			finally:
 				if fp is not None:
 					fp.close()

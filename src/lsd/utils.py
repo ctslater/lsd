@@ -2,6 +2,136 @@ import subprocess, os, errno
 import numpy as np
 import contextlib
 
+class NamedList(list):
+	def __init__(self, *items):
+		self.names = [ name for name, _ in items ]
+		list.__init__(self, [ col for _, col in items ])
+
+class Namespace:
+	def __init__(self, name=''):
+		self.__name__ = name
+
+class ModuleProxy(object):
+	""" A proxy class used to wrap modules imported as UDFs
+	    to make them pickleable.
+	"""
+	def __init__(self, obj):
+		object.__setattr__(self, '_obj_', obj)
+
+	## Forward non-pickle calls to the real module
+	def __getattribute__(self, name):
+		#print "GET:", name
+		if name in ['__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
+			return object.__getattribute__(self, name)
+		obj = object.__getattribute__(self, '_obj_')
+		return getattr(obj, name)
+	
+	def __setattr__(self, name, value):
+		obj = object.__getattribute__(self, '_obj_')
+		return setattr(obj, name, value)
+
+	def __delattr__(self, name):
+		obj = object.__getattribute__(self, '_obj_')
+		return delattr(obj, name)
+
+
+	## Pickling support: just store the module name, for reconstruction later on
+	def __getstate__(self):
+		obj = object.__getattribute__(self, '_obj_')
+		return obj.__name__,
+
+	def __setstate__(self, state):
+		name, = state
+		__import__(name)
+		object.__setattr__(self, '_obj_', sys.modules[name])
+
+class LazyCreate(object):
+	""" Lazy (on-demand) creation of objects.
+	
+	    This class allows the object to appear instantiated, while
+	    in fact it will be instantiated on first use. This is useful
+	    for "heavy" (== memory consuming) objects that may or may
+	    not be called by the user -- if they're never called, they
+	    are never created.
+	    
+	    Example usage:
+	    ====
+	    I instead of:
+	    	obj = HeavyObject(arg1, arg2, ...)
+	    replace it by:
+	        obj = LazyCreate(HeavyObject, arg1, arg2, ...)
+
+	    The object's constructor will not be called until it's
+	    actually accessed (e.g., a method is called on it, or
+	    an attribute is accessed). All of this is transparent
+	    to users of obj -- it behaves exactly like an instance
+	    of HeavyObject.
+	    
+	    Special kwargs read by LazyCreate:
+	    ==================================
+	    _LC_del_on_pickle -- (default: True)
+	    	Destroy the inner object when pickled, if it was already
+	    	instantiated. When unpickled, the LazyCreate instance will
+	    	start with the inner object uncreated.
+	"""
+	def __init__(self, cls, *args, **kwargs):
+		# Extract arguments intended for LazyCreate
+		lcargs = Namespace()
+		lcargs.del_on_pickle = True
+		for k, v in kwargs.iteritems():
+			if k.startswith('_LC_'): setattr(lcargs, k[4:], v)
+
+		kwargs = { k: v for k, v in kwargs.iteritems() if not k.startswith('_LC_') }
+
+		# Store the attributes
+		object.__setattr__(self, '__LazyCreate__data__', (cls, args, kwargs))
+		object.__setattr__(self, '__LazyCreate__obj__', None)
+		object.__setattr__(self, '__LazyCreate__lcargs__', lcargs)
+
+	def __getattribute__(self, name):
+		if name in ['_LazyCreate__get_internal', '__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
+			return object.__getattribute__(self, name)
+		return getattr(self.__get_internal(), name)
+
+	def __setattr__(self, name, value):
+		return setattr(self.__get_internal(), name, value)
+
+	def __delattr__(self, name):
+		return delattr(self.__get_internal(), name)
+
+	def __call__(self, *args, **kwargs):
+		return self.__get_internal()(*args, **kwargs)
+
+	## Object auto-creation
+	def __get_internal(self):
+		obj = object.__getattribute__(self, '__LazyCreate__obj__')
+		if obj is None:
+			cls, args, kwargs = object.__getattribute__(self, '__LazyCreate__data__')
+			obj = cls(*args, **kwargs)
+			object.__setattr__(self, '__LazyCreate__obj__', obj)
+
+		return obj
+
+	## Pickling support: if the object hasn't been constructed,
+	## pickling this class won't trigger its construction. But if the object
+	## has been constructed, the constructed instance will be pickled and
+	## passed along.
+	def __getstate__(self):
+		objdef = object.__getattribute__(self, '__LazyCreate__data__')
+		obj    = object.__getattribute__(self, '__LazyCreate__obj__')
+		lcargs = object.__getattribute__(self, '__LazyCreate__lcargs__')
+
+		if lcargs.del_on_pickle:
+			obj = None
+
+		return lcargs, objdef, obj
+
+	def __setstate__(self, state):
+		lcargs, objdef, obj = state
+		object.__setattr__(self, '__LazyCreate__lcargs__', lcargs)
+		object.__setattr__(self, '__LazyCreate__data__', objdef)
+		object.__setattr__(self, '__LazyCreate__obj__', obj)
+
 def open_ex(fname):
 	""" Transparently open bzipped/gzipped/raw file, based on suffix """
 	# lifted from numpy.loadtxt
